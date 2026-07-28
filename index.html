@@ -1,0 +1,338 @@
+<!--
+    Minimal Sweep Clock
+    - Single self-contained file: runs in any modern browser (Windows, macOS, Android, iOS, Linux).
+    - No dependencies, no network, works fully offline.
+
+    Rendering architecture:
+    - The static face (ring, ticks, date text) is an SVG, rasterized once into its own layer.
+    - The three hands are HTML <div>s promoted to GPU layers via `will-change: transform`.
+      Rotating a composited layer is a COMPOSITOR-ONLY operation: no layout, no paint, no
+      re-rasterization. (An earlier version rotated SVG <g> elements, which can't be
+      composited per-element and therefore re-rendered the whole vector image every frame.)
+
+    Design principle: STATELESS RENDERING.
+    Every animation frame re-derives the displayed time straight from the wall clock
+    (`new Date()`). Nothing is cached between frames that could go stale, so the clock
+    is self-correcting by construction. After sleep, a suspended/frozen tab, an NTP/DST
+    clock change, or a VM snapshot restore, the very next painted frame reads the real
+    time and snaps to it -- no event listeners, no polling timer, and never a refresh.
+
+    The render loop reschedules itself BEFORE doing any work and the body is wrapped in
+    try/catch, so a transient error can never wedge the loop into a stopped state.
+
+    PWA: pairs with manifest.webmanifest, sw.js, and icon.svg. The service worker makes
+    it installable and offline-capable when served over https; on file:// the
+    registration silently no-ops and the file still works by double-click.
+-->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#0a0b0e">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="manifest.webmanifest">
+<title>Clock</title>
+
+<style>
+    /* ---- Theme tokens (swap the accent here to recolor the second hand) ---- */
+    :root {
+        --bg-outer:  #0a0b0e;
+        --bg-inner:  #14161c;
+        --hand:      #ece9e2;   /* warm off-white: hour + minute */
+        --accent:    #efab3c;   /* warm amber/gold: second hand */
+        --tick-maj:  #cfd2d8;   /* hour markers */
+        --tick-min:  #3c3f47;   /* minute ticks */
+        --weekday:   #dadce1;
+        --date:      #8c919b;
+        --hint:      #4a4e57;
+        --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+                Helvetica, Arial, sans-serif;
+        --mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, "Courier New", monospace;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body { height: 100%; margin: 0; }
+
+    body {
+        min-height: 100vh;
+        min-height: 100dvh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+        background: radial-gradient(circle at 50% 42%, var(--bg-inner), var(--bg-outer) 72%);
+        font-family: var(--font);
+        -webkit-user-select: none;
+        user-select: none;
+        touch-action: manipulation;     /* no double-tap zoom on mobile */
+        cursor: default;
+    }
+
+    /* ---- Clock container: square, hands positioned relative to its center ---- */
+    #clock {
+        position: relative;
+        width: 92vmin;
+        height: 92vmin;
+    }
+
+    /* ---- Static face (painted once; never animates) ---- */
+    .face { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+    .ring { fill: none; stroke: rgba(255,255,255,0.04); stroke-width: 0.6; }
+    .tick     { stroke: var(--tick-min); stroke-width: 0.7;  stroke-linecap: round; }
+    .tick.maj { stroke: var(--tick-maj); stroke-width: 1.4;  stroke-linecap: round; }
+    .weekday, .date { text-anchor: middle; font-family: var(--font); }
+    .weekday { font-size: 4.4px; fill: var(--weekday); letter-spacing: 0.6px; font-weight: 600; }
+    .date    { font-size: 4.0px; fill: var(--date);    letter-spacing: 0.5px; font-weight: 500; }
+
+    /* ---- Hands: composited HTML layers, rotated about the clock center ----
+       Each hand is a vertical bar. `--pivot` is the point along the bar (as a % of its
+       own height) that sits exactly on the clock center, so `transform-origin: 50% pivot`
+       makes rotate() spin it about the center. pivot = (50 - top) / height. */
+    .hand {
+        position: absolute;
+        left: 50%;
+        transform-origin: 50% var(--pivot);
+        will-change: transform;     /* promote to its own GPU layer */
+        background: var(--hand);
+        border-radius: 1000px;      /* capsule ends */
+    }
+    .hour   { top: 23%; height: 33%; width: 3.2%; margin-left: -1.60%; --pivot: 81.82%; }
+    .minute { top: 11%; height: 46%; width: 2.3%; margin-left: -1.15%; --pivot: 84.78%; }
+    .second {
+        top: 8%; height: 52%; width: 1.0%; margin-left: -0.50%; --pivot: 80.77%;
+        background: var(--accent);
+    }
+    .second::after {                /* counterweight on the tail */
+        content: "";
+        position: absolute;
+        left: 50%; top: 94.23%;
+        width: 3.4vmin; height: 3.4vmin;
+        margin: -1.7vmin 0 0 -1.7vmin;
+        border-radius: 50%;
+        background: var(--accent);
+    }
+
+    /* ---- Center pinion (static, on top of the hands) ---- */
+    .cap, .pin { position: absolute; left: 50%; top: 50%; border-radius: 50%; }
+    .cap { width: 3.6vmin; height: 3.6vmin; margin: -1.8vmin 0 0 -1.8vmin; background: var(--hand); }
+    .pin { width: 1.6vmin; height: 1.6vmin; margin: -0.8vmin 0 0 -0.8vmin; background: var(--accent); }
+
+    /* ---- Fullscreen hint ---- */
+    #hint {
+        position: fixed;
+        left: 0; right: 0;
+        bottom: max(16px, env(safe-area-inset-bottom));
+        text-align: center;
+        color: var(--hint);
+        font-size: 12px;
+        letter-spacing: 0.08em;
+        pointer-events: none;
+        transition: opacity 1s ease;
+    }
+    #hint.gone { opacity: 0; }
+
+    /* ---- Optional diagnostic overlay (press "d") ---- */
+    #debug {
+        position: fixed;
+        top: max(10px, env(safe-area-inset-top));
+        left: 12px;
+        display: none;
+        white-space: pre;
+        pointer-events: none;
+        font: 12px/1.5 var(--mono);
+        color: #6b7180;
+    }
+</style>
+
+<div id="clock">
+    <svg class="face" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+        <circle class="ring" cx="50" cy="50" r="47.8"/>
+
+        <!-- tick marks are generated by JS to keep the markup tiny -->
+        <g id="ticks"></g>
+
+        <!-- date / day of week -->
+        <text id="weekday" class="weekday" x="50" y="63">SUNDAY</text>
+        <text id="date"    class="date"    x="50" y="69">31 MAY 2026</text>
+    </svg>
+
+    <!-- hands (rotated about the clock center via composited transforms) -->
+    <div id="hour"   class="hand hour"></div>
+    <div id="minute" class="hand minute"></div>
+    <div id="second" class="hand second"></div>
+
+    <!-- center pinion -->
+    <div class="cap"></div>
+    <div class="pin"></div>
+</div>
+
+<div id="hint">tap anywhere for fullscreen &middot; press &ldquo;d&rdquo; for diagnostics</div>
+<div id="debug"></div>
+
+<script>
+    "use strict";
+
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    const DAYS   = ["SUNDAY","MONDAY","TUESDAY","WEDNESDAY","THURSDAY","FRIDAY","SATURDAY"];
+    const MONTHS = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
+
+    const hour      = document.getElementById("hour");
+    const minute    = document.getElementById("minute");
+    const second    = document.getElementById("second");
+    const weekdayEl = document.getElementById("weekday");
+    const dateEl    = document.getElementById("date");
+    const debugEl   = document.getElementById("debug");
+
+    /**
+     * Build the 60 tick marks once into the static face. Every 5th tick is a bolder
+     * hour marker. This is the only SVG mutation that happens after load (plus the
+     * date text, once a day) -- the face never re-renders during the animation.
+     */
+    (function buildTicks() {
+        const g = document.getElementById("ticks");
+        for (let i = 0; i < 60; i++) {
+            const major = (i % 5) === 0;
+            const a = i * 6 * Math.PI / 180;        // radians, 0 = top, clockwise
+            const r1 = 46;                          // outer radius
+            const r2 = major ? 41.5 : 44;           // inner radius
+            const s = Math.sin(a), c = Math.cos(a);
+            const line = document.createElementNS(SVG_NS, "line");
+            line.setAttribute("x1", (50 + r1 * s).toFixed(2));
+            line.setAttribute("y1", (50 - r1 * c).toFixed(2));
+            line.setAttribute("x2", (50 + r2 * s).toFixed(2));
+            line.setAttribute("y2", (50 - r2 * c).toFixed(2));
+            line.setAttribute("class", major ? "tick maj" : "tick");
+            g.appendChild(line);
+        }
+    })();
+
+    // ---- Render-loop state. The only things remembered between frames are write-skip
+    //      caches; they are recomputed unconditionally every frame, so they cannot wedge.
+    let lastMin   = null;   // last minute-hand angle written to the DOM
+    let lastHour  = null;   // last hour-hand angle written to the DOM
+    let lastDate  = -1;     // last day-of-month rendered into the date text
+    let lastPerf  = (typeof performance !== "undefined" ? performance.now() : 0);
+    let debugOn   = false;
+    let resumeMsg = "";
+    let resumeUntil = 0;
+
+    /**
+     * The render loop. Derives every hand position from the live wall clock each frame.
+     * Reschedules itself FIRST so the loop survives any error thrown in the body.
+     * Each style write changes only `transform` on an already-composited layer, so the
+     * browser handles it on the compositor without layout/paint.
+     */
+    function tick() {
+        requestAnimationFrame(tick);
+
+        try {
+            const p = (typeof performance !== "undefined" ? performance.now() : Date.now());
+            const gap = p - lastPerf;       // ms since the previous frame
+            lastPerf = p;
+
+            const now = new Date();
+            const s = now.getSeconds() + now.getMilliseconds() / 1000;   // 0..60
+            const m = now.getMinutes() + s / 60;                         // 0..60
+            const h = (now.getHours() % 12) + m / 60;                    // 0..12
+
+            // Second hand: read from the clock and written every frame (it always moves).
+            second.style.transform = "rotate(" + (s * 6).toFixed(2) + "deg)";
+
+            // Minute / hour: same unconditional math, but skip the redundant DOM write
+            // when the (rounded) angle has not changed. Purely an output optimization.
+            const minDeg = +(m * 6).toFixed(2);
+            if (minDeg !== lastMin) { lastMin = minDeg; minute.style.transform = "rotate(" + minDeg + "deg)"; }
+
+            const hourDeg = +(h * 30).toFixed(2);
+            if (hourDeg !== lastHour) { lastHour = hourDeg; hour.style.transform = "rotate(" + hourDeg + "deg)"; }
+
+            // Date text: only rewritten when the calendar day actually changes.
+            const d = now.getDate();
+            if (d !== lastDate) {
+                lastDate = d;
+                weekdayEl.textContent = DAYS[now.getDay()];
+                dateEl.textContent = d + " " + MONTHS[now.getMonth()] + " " + now.getFullYear();
+            }
+
+            // A large frame gap means we just resumed (sleep / frozen tab / VM restore /
+            // big clock change). Nothing special is required -- the lines above already
+            // snapped to the correct time -- but we surface it for the diagnostics view.
+            if (gap > 1500) {
+                resumeMsg = "resumed after " + (gap / 1000).toFixed(1) + "s \u2014 snapped to clock";
+                resumeUntil = p + 4000;
+            }
+
+            if (debugOn) {
+                const z = n => String(n).padStart(2, "0");
+                debugEl.textContent =
+                    z(now.getHours()) + ":" + z(now.getMinutes()) + ":" + z(now.getSeconds()) +
+                        "  " + DAYS[now.getDay()] + "\n" +
+                    "frame gap " + gap.toFixed(1) + " ms  (~" + (gap > 0 ? (1000 / gap).toFixed(0) : "0") + " fps)\n" +
+                    (p < resumeUntil ? resumeMsg : "self-correcting every frame \u2014 sleep or change the clock to test");
+            }
+        } catch (e) {
+            /* A transient error must never stop the render loop; the next frame retries. */
+        }
+    }
+
+    // Start the loop. While the page is hidden the browser pauses rAF (saving power) and
+    // resumes it on return; the first resumed frame reads the real time, so no listeners
+    // are needed to recover from background/sleep states.
+    requestAnimationFrame(tick);
+
+    // Tap / click toggles fullscreen so it works as a proper desk clock.
+    document.body.addEventListener("click", () => {
+        const root = document.documentElement;
+        const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+        if (!fsEl) {
+            (root.requestFullscreen || root.webkitRequestFullscreen || function () {}).call(root);
+        } else {
+            (document.exitFullscreen || document.webkitExitFullscreen || function () {}).call(document);
+        }
+    });
+
+    // "d" toggles the diagnostic overlay (desktop dev aid).
+    document.addEventListener("keydown", (e) => {
+        if (e.key === "d" || e.key === "D") {
+            debugOn = !debugOn;
+            debugEl.style.display = debugOn ? "block" : "none";
+        }
+    });
+
+    // Fade out the hint after a few seconds.
+    setTimeout(() => document.getElementById("hint").classList.add("gone"), 4000);
+
+    // ---- PWA: offline cache ----
+    // Feature-detected and silent: on file:// or unsupported browsers this no-ops,
+    // so the file still works by double-click with no server.
+    if ("serviceWorker" in navigator) {
+        addEventListener("load", () => {
+            navigator.serviceWorker.register("./sw.js").catch(() => {});
+        });
+    }
+
+    // ---- Keep the screen awake while in fullscreen (desk-clock mode) ----
+    // Stateless like the render loop: on every relevant event, re-derive the desired
+    // lock state from the current fullscreen + visibility status and converge to it.
+    // The OS releases wake locks when the page is hidden; visibilitychange re-acquires.
+    let wakeLock = null;
+    async function syncWakeLock() {
+        const want = !!(document.fullscreenElement || document.webkitFullscreenElement)
+                     && !document.hidden;
+        try {
+            if (want && !wakeLock && "wakeLock" in navigator) {
+                wakeLock = await navigator.wakeLock.request("screen");
+                wakeLock.addEventListener("release", () => { wakeLock = null; });
+            } else if (!want && wakeLock) {
+                await wakeLock.release();
+                wakeLock = null;
+            }
+        } catch (e) {
+            wakeLock = null;    /* unsupported or denied: never critical */
+        }
+    }
+    document.addEventListener("fullscreenchange", syncWakeLock);
+    document.addEventListener("webkitfullscreenchange", syncWakeLock);
+    document.addEventListener("visibilitychange", syncWakeLock);
+</script>
